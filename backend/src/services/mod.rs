@@ -3,3 +3,7 @@ pub mod damage_diagnosis;
 pub mod alarm_engine;
 pub mod mes_pusher;
 pub mod signal_processing;
+pub mod ethernet_driver;
+pub mod damage_classifier;
+pub mod strain_interpolator;
+pub mod alarm_pusher;

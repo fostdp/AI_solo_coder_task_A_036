@@ -13,6 +13,7 @@ use crate::models::{
     damage::DamageFeatures,
     response::ApiResponse,
 };
+use crate::services::ethernet_driver::DriverMessage;
 
 #[utoipa::path(
     post,
@@ -29,25 +30,31 @@ pub async fn receive_strain_data(
     State(state): State<AppState>,
     Json(batch): Json<StrainDataBatch>,
 ) -> impl IntoResponse {
-    log::info!("收到应变数据，共{}条", batch.data.len());
+    log::info!("收到应变数据，共{}条，发送到以太网驱动预处理管道", batch.data.len());
 
-    match state.influxdb.write_strain_data(&batch.data).await {
-        Ok(_) => {
-            for data in &batch.data {
-                if let Err(e) = state.influxdb.update_blade_health_from_strain(data).await {
-                    log::error!("更新叶片健康状态失败: {}", e);
-                }
-            }
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success("应变数据已保存".to_string())),
-            )
+    let influxdb = state.influxdb.clone();
+    let data_clone = batch.data.clone();
+    tokio::spawn(async move {
+        if let Err(e) = influxdb.bulk_write_all(&data_clone, &[], None).await {
+            log::error!("批量写入应变数据失败: {}", e);
         }
+        for data in &data_clone {
+            if let Err(e) = influxdb.update_blade_health_from_strain(data).await {
+                log::error!("更新叶片健康状态失败: {}", e);
+            }
+        }
+    });
+
+    match state.pipeline.driver_sender.send(DriverMessage::StrainData(batch.data)).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::success("应变数据已进入预处理管道".to_string())),
+        ),
         Err(e) => {
-            log::error!("保存应变数据失败: {}", e);
+            log::error!("发送应变数据到管道失败: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<String>::error(&format!("保存失败: {}", e))),
+                Json(ApiResponse::<String>::error(&format!("管道发送失败: {}", e))),
             )
         }
     }
@@ -68,101 +75,54 @@ pub async fn receive_ae_events(
     State(state): State<AppState>,
     Json(batch): Json<AEEventBatch>,
 ) -> impl IntoResponse {
-    log::info!("收到声发射事件，共{}条", batch.events.len());
+    log::info!(
+        "收到声发射事件，共{}条，发送到以太网驱动预处理管道",
+        batch.events.len()
+    );
 
-    let mut damage_features_batch = Vec::with_capacity(batch.events.len());
+    let influxdb = state.influxdb.clone();
+    let events_clone = batch.events.clone();
+    tokio::spawn(async move {
+        let events_ref: Vec<&AEEvent> = events_clone.iter().collect();
+        if let Err(e) = influxdb.write_ae_events(&events_ref).await {
+            log::error!("批量写入声发射事件失败: {}", e);
+        }
+    });
 
-    for event in &batch.events {
+    let mut results = Vec::new();
+    for event in batch.events {
         let wind_speed = event.wind_speed.unwrap_or(8.0);
         let rotor_speed = event.rotor_speed.unwrap_or(12.0);
+        results.push((event, wind_speed, rotor_speed));
+    }
 
-        let diagnosis = match state.diagnosis.diagnose_with_conditions(
-            event.amplitude,
-            event.duration,
-            event.frequency_peak,
-            event.frequency_center,
-            event.energy,
-            event.counts,
-            wind_speed,
-            rotor_speed,
-        ) {
-            Ok(d) => d,
+    let mut send_errors = 0;
+    for (event, wind, rotor) in results {
+        match state.pipeline.driver_sender.send(
+            DriverMessage::AEEvent(event, wind, rotor)
+        ).await {
+            Ok(_) => {}
             Err(e) => {
-                log::warn!("信号处理失败，使用原始诊断: {}", e);
-                state.diagnosis.diagnose(
-                    event.amplitude,
-                    event.duration,
-                    event.frequency_peak,
-                    event.frequency_center,
-                    event.energy,
-                    event.counts,
-                )
+                log::error!("发送声发射事件到管道失败: {}", e);
+                send_errors += 1;
             }
-        };
-
-        let damage_features = DamageFeatures {
-            turbine_id: event.turbine_id.clone(),
-            blade_id: event.blade_id.clone(),
-            section: event.section.clone(),
-            matrix_cracking_prob: diagnosis.matrix_cracking_prob,
-            fiber_breakage_prob: diagnosis.fiber_breakage_prob,
-            delamination_prob: diagnosis.delamination_prob,
-            damage_severity: diagnosis.severity_level as i32 * 25,
-            natural_frequency: 12.5,
-            delamination_rate: diagnosis.delamination_prob * 10.0,
-            health_score: 100 - (diagnosis.severity_level as i32 * 25),
-            wind_speed,
-            rotor_speed,
-            timestamp: event.timestamp,
-        };
-
-        damage_features_batch.push(damage_features);
+        }
     }
 
-    let mut ae_events_to_write = Vec::with_capacity(batch.events.len());
-    for event in &batch.events {
-        ae_events_to_write.push(event.clone());
-    }
-
-    let first_features = damage_features_batch.first().cloned();
-
-    match state.influxdb.bulk_write_all(
-        &ae_events_to_write,
-        &[],
-        first_features.as_ref(),
-    ).await {
-        Ok(_) => {
-            for features in &damage_features_batch {
-                if let Err(e) = state.influxdb.write_damage_features(features).await {
-                    log::error!("保存损伤特征失败: {}", e);
-                }
-
-                let mut alarm_engine = state.alarm_engine.lock().await;
-                
-                if let Err(e) = alarm_engine.check_frequency_with_conditions(
-                    features,
-                    None,
-                ) {
-                    log::error!("频率告警检查失败: {}", e);
-                }
-
-                if let Err(e) = alarm_engine.check_and_trigger_alarm(features).await {
-                    log::error!("告警检查失败: {}", e);
-                }
-            }
-
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success("声发射事件已保存并分析完成（已应用小波去噪和工况归一化）".to_string())),
-            )
-        }
-        Err(e) => {
-            log::error!("批量写入失败: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<String>::error(&format!("保存失败: {}", e))),
-            )
-        }
+    if send_errors > 0 {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<String>::error(&format!(
+                "{}条事件发送到管道失败", send_errors
+            ))),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                "声发射事件已进入预处理管道（小波去噪+工况归一化+随机森林分类异步执行）".to_string()
+            )),
+        )
     }
 }
 
@@ -182,29 +142,35 @@ pub async fn receive_damage_features(
     Json(features): Json<DamageFeatures>,
 ) -> impl IntoResponse {
     log::info!(
-        "收到损伤特征: {}-{} 损伤严重度: {}",
+        "收到损伤特征: {}-{} 损伤严重度: {}，发送到分类器和告警管道",
         features.turbine_id,
         features.blade_id,
         features.damage_severity
     );
 
-    match state.influxdb.write_damage_features(&features).await {
-        Ok(_) => {
-            let mut alarm_engine = state.alarm_engine.lock().await;
-            if let Err(e) = alarm_engine.check_and_trigger_alarm(&features).await {
-                log::error!("告警检查失败: {}", e);
-            }
-
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success("损伤特征已保存".to_string())),
-            )
-        }
-        Err(e) => {
+    let influxdb = state.influxdb.clone();
+    let features_clone = features.clone();
+    tokio::spawn(async move {
+        if let Err(e) = influxdb.write_damage_features(&features_clone).await {
             log::error!("保存损伤特征失败: {}", e);
+        }
+
+        let mut alarm_engine = state.alarm_engine.lock().await;
+        if let Err(e) = alarm_engine.check_and_trigger_alarm(&features_clone).await {
+            log::error!("告警检查失败: {}", e);
+        }
+    });
+
+    match state.pipeline.damage_from_driver_sender.send(features).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::success("损伤特征已进入分类器和告警管道".to_string())),
+        ),
+        Err(e) => {
+            log::error!("发送损伤特征到管道失败: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<String>::error(&format!("保存失败: {}", e))),
+                Json(ApiResponse::<String>::error(&format!("管道发送失败: {}", e))),
             )
         }
     }
