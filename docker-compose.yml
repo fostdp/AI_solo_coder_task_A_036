@@ -1,0 +1,194 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # InfluxDB - Time Series Database
+  # ============================================
+  influxdb:
+    image: influxdb:1.8.10-alpine
+    container_name: wind-monitor-influxdb
+    restart: unless-stopped
+    environment:
+      - INFLUXDB_DB=wind_monitor
+      - INFLUXDB_ADMIN_USER=admin
+      - INFLUXDB_ADMIN_PASSWORD=admin123
+      - INFLUXDB_USER=wind_user
+      - INFLUXDB_USER_PASSWORD=wind_pass123
+      - INFLUXDB_HTTP_AUTH_ENABLED=true
+      - INFLUXDB_DATA_MAX_SERIES_PER_DATABASE=1000000
+      - INFLUXDB_DATA_MAX_VALUES_PER_TAG=100000
+      - INFLUXDB_COORDINATOR_WRITE_TIMEOUT=30s
+      - INFLUXDB_HTTP_WRITE_TIMEOUT=30s
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+      - ./influxdb/init.iql:/docker-entrypoint-initdb.d/init.iql:ro
+    ports:
+      - "8086:8086"
+    networks:
+      - wind_monitor_net
+    healthcheck:
+      test: ["CMD", "influx", "-execute", "SHOW DATABASES"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ============================================
+  # Rust Backend Service
+  # ============================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: wind-monitor-backend
+    restart: unless-stopped
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info,wind_turbine_blade_monitor=debug
+      - LOG_FORMAT=json
+      - RUST_BACKTRACE=1
+      - CONFIG_PATH=/app/config/model_config.toml
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - CHANNEL_BUFFER_SIZE=1000
+      - INFLUXDB_HOST=influxdb
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_DATABASE=wind_monitor
+      - INFLUXDB_USER=wind_user
+      - INFLUXDB_PASSWORD=wind_pass123
+      - INFLUXDB_USE_SSL=false
+      - INFLUXDB_BATCH_SIZE=500
+      - INFLUXDB_BATCH_TIMEOUT_MS=100
+      - INFLUXDB_CONNECTION_POOL_SIZE=8
+      - MES_API_URL=http://mes.example.com/api/alerts
+      - MES_API_TOKEN=your_mes_token_here
+      - MES_ENABLED=false
+    ports:
+      - "8000:8000"
+    networks:
+      - wind_monitor_net
+    volumes:
+      - ./backend/config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ============================================
+  # Sensor Simulator
+  # ============================================
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: wind-monitor-simulator
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      - API_URL=http://backend:8000/api/v1/sensor
+      - TURBINE_COUNT=100
+      - BLADES_PER_TURBINE=3
+      - STRAIN_SENSORS_PER_BLADE=20
+      - AE_SENSORS_PER_BLADE=10
+      - REPORT_INTERVAL=600
+      - DAMAGE_PROBABILITY=0.15
+      - DAMAGE_INJECTION_ENABLED=true
+      - DAMAGE_INJECTION_INTERVAL=300
+      - INJECTED_DAMAGE_TYPE=delamination
+      - INJECTED_TURBINE_ID=WT050
+      - WIND_SPEED_MIN=5.0
+      - WIND_SPEED_MAX=20.0
+      - ROTOR_SPEED_MIN=8.0
+      - ROTOR_SPEED_MAX=15.0
+    networks:
+      - wind_monitor_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://backend:8000/health', timeout=5); print('OK')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================
+  # Prometheus - Metrics Collection
+  # ============================================
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: wind-monitor-prometheus
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - wind_monitor_net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ============================================
+  # Grafana - Visualization Dashboard
+  # ============================================
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: wind-monitor-grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - wind_monitor_net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  wind_monitor_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  influxdb_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local

@@ -1,36 +1,93 @@
-CREATE DATABASE wind_turbine_blades WITH DURATION 365d REPLICATION 1 SHARD DURATION 7d NAME "autogen"
+CREATE DATABASE wind_monitor WITH DURATION 365d REPLICATION 1 SHARD DURATION 7d NAME "autogen"
 
-CREATE RETENTION POLICY "raw_data" ON "wind_turbine_blades" DURATION 90d REPLICATION 1 SHARD DURATION 1d
-CREATE RETENTION POLICY "hourly_agg" ON "wind_turbine_blades" DURATION 365d REPLICATION 1 SHARD DURATION 7d
-CREATE RETENTION POLICY "daily_agg" ON "wind_turbine_blades" DURATION 1095d REPLICATION 1 SHARD DURATION 30d
+-- ============================================
+-- Retention Policies (数据保留策略)
+-- ============================================
+-- 原始数据保留90天，用于详细分析
+CREATE RETENTION POLICY "raw_data" ON "wind_monitor" DURATION 90d REPLICATION 1 SHARD DURATION 1d
+-- 小时聚合数据保留365天，用于趋势分析
+CREATE RETENTION POLICY "hourly_agg" ON "wind_monitor" DURATION 365d REPLICATION 1 SHARD DURATION 7d
+-- 日聚合数据保留3年，用于长期统计
+CREATE RETENTION POLICY "daily_agg" ON "wind_monitor" DURATION 1095d REPLICATION 1 SHARD DURATION 30d
 
-CREATE CONTINUOUS QUERY "cq_strain_hourly" ON "wind_turbine_blades"
+-- ============================================
+-- Continuous Queries (连续查询/降采样)
+-- ============================================
+-- 应变数据每小时聚合
+CREATE CONTINUOUS QUERY "cq_strain_hourly" ON "wind_monitor"
 BEGIN
-  SELECT mean(strain_value) AS mean_strain, max(strain_value) AS max_strain, min(strain_value) AS min_strain
+  SELECT mean(strain_value) AS mean_strain, max(strain_value) AS max_strain, min(strain_value) AS min_strain,
+         stddev(strain_value) AS stddev_strain, count(strain_value) AS count_strain
   INTO "hourly_agg"."strain_hourly"
   FROM "raw_data"."strain_data"
-  GROUP BY time(1h), turbine_id, blade_id, sensor_id
+  GROUP BY time(1h), turbine_id, blade_id, sensor_id, section
 END
 
-CREATE CONTINUOUS QUERY "cq_strain_daily" ON "wind_turbine_blades"
+-- 应变数据每日聚合
+CREATE CONTINUOUS QUERY "cq_strain_daily" ON "wind_monitor"
 BEGIN
-  SELECT mean(strain_value) AS mean_strain, max(strain_value) AS max_strain, min(strain_value) AS min_strain
+  SELECT mean(strain_value) AS mean_strain, max(strain_value) AS max_strain, min(strain_value) AS min_strain,
+         stddev(strain_value) AS stddev_strain, count(strain_value) AS count_strain
   INTO "daily_agg"."strain_daily"
   FROM "raw_data"."strain_data"
-  GROUP BY time(1d), turbine_id, blade_id, sensor_id
+  GROUP BY time(1d), turbine_id, blade_id, sensor_id, section
 END
 
-CREATE CONTINUOUS QUERY "cq_ae_hourly" ON "wind_turbine_blades"
+-- 声发射事件每小时聚合
+CREATE CONTINUOUS QUERY "cq_ae_hourly" ON "wind_monitor"
 BEGIN
-  SELECT count(amplitude) AS event_count, mean(amplitude) AS mean_amplitude, max(amplitude) AS max_amplitude
+  SELECT count(amplitude) AS event_count, mean(amplitude) AS mean_amplitude, max(amplitude) AS max_amplitude,
+         mean(duration) AS mean_duration, mean(frequency_peak) AS mean_frequency,
+         sum(energy) AS total_energy
   INTO "hourly_agg"."ae_hourly"
   FROM "raw_data"."ae_events"
-  GROUP BY time(1h), turbine_id, blade_id, sensor_id
+  GROUP BY time(1h), turbine_id, blade_id, sensor_id, section
 END
 
+-- 声发射事件每日聚合
+CREATE CONTINUOUS QUERY "cq_ae_daily" ON "wind_monitor"
+BEGIN
+  SELECT count(amplitude) AS event_count, mean(amplitude) AS mean_amplitude, max(amplitude) AS max_amplitude,
+         mean(duration) AS mean_duration, sum(energy) AS total_energy
+  INTO "daily_agg"."ae_daily"
+  FROM "raw_data"."ae_events"
+  GROUP BY time(1d), turbine_id, blade_id, sensor_id, section
+END
+
+-- 损伤特征每小时聚合
+CREATE CONTINUOUS QUERY "cq_damage_hourly" ON "wind_monitor"
+BEGIN
+  SELECT mean(matrix_cracking_prob) AS mean_matrix_prob,
+         mean(fiber_breakage_prob) AS mean_fiber_prob,
+         mean(delamination_prob) AS mean_delam_prob,
+         mean(damage_severity) AS mean_severity,
+         mean(health_score) AS mean_health_score,
+         mean(natural_frequency) AS mean_natural_freq
+  INTO "hourly_agg"."damage_hourly"
+  FROM "raw_data"."damage_features"
+  GROUP BY time(1h), turbine_id, blade_id, section
+END
+
+-- 损伤特征每日聚合
+CREATE CONTINUOUS QUERY "cq_damage_daily" ON "wind_monitor"
+BEGIN
+  SELECT mean(matrix_cracking_prob) AS mean_matrix_prob,
+         mean(fiber_breakage_prob) AS mean_fiber_prob,
+         mean(delamination_prob) AS mean_delam_prob,
+         mean(damage_severity) AS mean_severity,
+         mean(health_score) AS mean_health_score
+  INTO "daily_agg"."damage_daily"
+  FROM "raw_data"."damage_features"
+  GROUP BY time(1d), turbine_id, blade_id, section
+END
+
+-- ============================================
+-- 用户权限
+-- ============================================
 CREATE USER "sensor_writer" WITH PASSWORD 'sensor_pass123'
 CREATE USER "dashboard_reader" WITH PASSWORD 'dash_pass123'
 CREATE USER "admin" WITH PASSWORD 'admin_pass123' WITH ALL PRIVILEGES
 
-GRANT WRITE ON wind_turbine_blades TO sensor_writer
-GRANT READ ON wind_turbine_blades TO dashboard_reader
+GRANT WRITE ON wind_monitor TO sensor_writer
+GRANT READ ON wind_monitor TO dashboard_reader
+GRANT ALL ON wind_monitor TO admin

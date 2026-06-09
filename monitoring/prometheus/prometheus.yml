@@ -1,0 +1,99 @@
+# Global settings
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+  external_labels:
+    monitor: 'wind-turbine-monitor'
+    cluster: 'production'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+          # - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+# Here it's Prometheus itself.
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Rust backend service metrics
+  - job_name: 'wind-monitor-backend'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['backend:8000']
+        labels:
+          service: 'backend'
+          environment: 'production'
+
+  # InfluxDB metrics
+  - job_name: 'influxdb'
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['influxdb:8086']
+        labels:
+          service: 'influxdb'
+          environment: 'production'
+
+  # Docker daemon metrics (optional)
+  - job_name: 'docker'
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['host.docker.internal:9323']
+        labels:
+          service: 'docker'
+          environment: 'production'
+
+# Alert rules
+groups:
+  - name: wind_monitor_alerts
+    rules:
+      - alert: BackendServiceDown
+        expr: up{job="wind-monitor-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend service is down"
+          description: "The Rust backend service has been down for more than 1 minute."
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP error rate"
+          description: "More than 5% of HTTP requests are returning 5xx errors over the last 5 minutes."
+
+      - alert: HighQueueSize
+        expr: ethernet_driver_queue_size > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ethernet driver queue is filling up"
+          description: "Ethernet driver queue size has exceeded 500 for more than 10 minutes."
+
+      - alert: InfluxDBWriteFailures
+        expr: rate(influxdb_write_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InfluxDB write failures detected"
+          description: "There are write failures to InfluxDB over the last 5 minutes."
