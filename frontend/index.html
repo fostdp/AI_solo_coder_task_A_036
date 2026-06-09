@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>大型风力发电机组叶片状态监测与修复决策系统</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;600;700&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="loading-screen" id="loadingScreen">
+        <div class="loading-content">
+            <div class="turbine-icon">
+                <svg viewBox="0 0 100 100" class="turbine-svg">
+                    <circle cx="50" cy="50" r="8" fill="#00d4ff"/>
+                    <g class="blades">
+                        <path d="M50 50 L50 10 Q60 5 50 0 Q40 5 50 10" fill="#00d4ff" class="blade"/>
+                        <path d="M50 50 L85 72 Q92 65 100 68 Q98 78 85 72" fill="#00d4ff" class="blade"/>
+                        <path d="M50 50 L15 72 Q8 65 0 68 Q2 78 15 72" fill="#00d4ff" class="blade"/>
+                    </g>
+                </svg>
+            </div>
+            <h1 class="loading-title">叶片状态监测系统</h1>
+            <div class="loading-bar">
+                <div class="loading-progress" id="loadingProgress"></div>
+            </div>
+            <p class="loading-text">系统初始化中...</p>
+        </div>
+    </div>
+
+    <header class="main-header">
+        <div class="header-left">
+            <div class="logo">
+                <svg viewBox="0 0 40 40" class="logo-svg">
+                    <circle cx="20" cy="20" r="4" fill="#00d4ff"/>
+                    <path d="M20 20 L20 4 Q24 2 20 0 Q16 2 20 4" fill="#00d4ff"/>
+                    <path d="M20 20 L34 29 Q37 26 40 27 Q39 31 34 29" fill="#00d4ff"/>
+                    <path d="M20 20 L6 29 Q3 26 0 27 Q1 31 6 29" fill="#00d4ff"/>
+                </svg>
+                <span class="logo-text">WindBlade Monitor</span>
+            </div>
+            <div class="system-title">
+                <h1>大型风力发电机组叶片状态监测与修复决策系统</h1>
+                <div class="system-subtitle">风场: 青山风电场 · 风机总数: 100台 · 叶片总数: 300片</div>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="status-indicators">
+                <div class="status-item">
+                    <span class="status-dot online"></span>
+                    <span class="status-label">系统在线</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-dot warning" id="alarmDot"></span>
+                    <span class="status-label" id="alarmCount">告警: 0</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-time" id="currentTime"></span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+        <aside class="sidebar">
+            <nav class="nav-menu">
+                <div class="nav-item active" data-view="dashboard">
+                    <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="7" height="7"/>
+                        <rect x="14" y="3" width="7" height="7"/>
+                        <rect x="14" y="14" width="7" height="7"/>
+                        <rect x="3" y="14" width="7" height="7"/>
+                    </svg>
+                    <span>总览仪表盘</span>
+                </div>
+                <div class="nav-item" data-view="blade3d">
+                    <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                        <line x1="12" y1="22.08" x2="12" y2="12"/>
+                    </svg>
+                    <span>叶片3D监测</span>
+                </div>
+                <div class="nav-item" data-view="health">
+                    <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+                    </svg>
+                    <span>健康度排行</span>
+                </div>
+                <div class="nav-item" data-view="damage">
+                    <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                        <line x1="12" y1="9" x2="12" y2="13"/>
+                        <line x1="12" y1="17" x2="12.01" y2="17"/>
+                    </svg>
+                    <span>损伤统计</span>
+                </div>
+                <div class="nav-item" data-view="alarms">
+                    <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 17h-6l-4 4-4-4H2V3h20z"/>
+                        <circle cx="6" cy="10" r="1"/>
+                        <circle cx="10" cy="10" r="1"/>
+                        <circle cx="14" cy="10" r="1"/>
+                    </svg>
+                    <span>告警中心</span>
+                </div>
+            </nav>
+
+            <div class="turbine-selector">
+                <label class="selector-label">选择风机</label>
+                <select id="turbineSelect" class="selector-select">
+                </select>
+                <label class="selector-label">选择叶片</label>
+                <div class="blade-buttons">
+                    <button class="blade-btn active" data-blade="A">叶片 A</button>
+                    <button class="blade-btn" data-blade="B">叶片 B</button>
+                    <button class="blade-btn" data-blade="C">叶片 C</button>
+                </div>
+            </div>
+        </aside>
+
+        <section class="content-area">
+            <div class="view-container" id="dashboardView">
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon health">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+                            </svg>
+                        </div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="avgHealth">--</div>
+                            <div class="stat-label">平均健康度</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-card">
+                        <div class="stat-icon healthy">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                                <polyline points="22 4 12 14.01 9 11.01"/>
+                            </svg>
+                        </div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="healthyCount">--</div>
+                            <div class="stat-label">健康叶片</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon warning">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                                <line x1="12" y1="9" x2="12" y2="13"/>
+                                <line x1="12" y1="17" x2="12.01" y2="17"/>
+                            </svg>
+                        </div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="warningCount">--</div>
+                            <div class="stat-label">预警叶片</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon danger">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <line x1="15" y1="9" x2="9" y2="15"/>
+                                <line x1="9" y1="9" x2="15" y2="15"/>
+                            </svg>
+                        </div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="damagedCount">--</div>
+                            <div class="stat-label">损伤叶片</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="charts-row">
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h3>损伤类型分布</h3>
+                            <div class="chart-legend" id="damageLegend"></div>
+                        </div>
+                        <canvas id="damageChart" width="400" height="300"></canvas>
+                    </div>
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h3>健康度趋势 (最近7天)</h3>
+                        </div>
+                        <canvas id="healthTrendChart" width="400" height="300"></canvas>
+                    </div>
+                </div>
+
+                <div class="blade-health-preview">
+                    <div class="chart-header">
+                        <h3>全场叶片健康度分布</h3>
+                    </div>
+                    <div class="blade-grid" id="bladeGrid"></div>
+                </div>
+            </div>
+
+            <div class="view-container" id="blade3dView" style="display: none;">
+                <div class="blade-3d-container">
+                    <div class="canvas-wrapper">
+                        <div id="threeContainer" class="three-container"></div>
+                        <div class="blade-overlay">
+                            <div class="blade-info-card" id="bladeInfoCard">
+                                <h3 id="bladeTitle">WT001 - 叶片 A</h3>
+                                <div class="health-score-ring">
+                                    <svg viewBox="0 0 120 120" class="score-ring">
+                                        <circle cx="60" cy="60" r="50" class="ring-bg"/>
+                                        <circle cx="60" cy="60" r="50" class="ring-progress" id="scoreRing"/>
+                                        <text x="60" y="65" text-anchor="middle" class="score-text" id="scoreText">--</text>
+                                    </svg>
+                                </div>
+                                <div class="blade-stats">
+                                    <div class="blade-stat">
+                                        <span class="stat-name">基体开裂</span>
+                                        <span class="stat-bar"><span class="bar-fill matrix" id="matrixBar"></span></span>
+                                        <span class="stat-value" id="matrixProb">--%</span>
+                                    </div>
+                                    <div class="blade-stat">
+                                        <span class="stat-name">纤维断裂</span>
+                                        <span class="stat-bar"><span class="bar-fill fiber" id="fiberBar"></span></span>
+                                        <span class="stat-value" id="fiberProb">--%</span>
+                                    </div>
+                                    <div class="blade-stat">
+                                        <span class="stat-name">分层损伤</span>
+                                        <span class="stat-bar"><span class="bar-fill delamination" id="delamBar"></span></span>
+                                        <span class="stat-value" id="delamProb">--%</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="control-panel">
+                            <div class="control-group">
+                                <label class="control-label">显示模式</label>
+                                <div class="control-buttons">
+                                    <button class="ctrl-btn active" data-mode="heatmap">热力图</button>
+                                    <button class="ctrl-btn" data-mode="ae">声发射</button>
+                                    <button class="ctrl-btn" data-mode="both">叠加显示</button>
+                                </div>
+                            </div>
+                            <div class="control-group">
+                                <label class="control-label">叶片截面</label>
+                                <div class="section-buttons">
+                                    <button class="section-btn" data-section="root">叶根</button>
+                                    <button class="section-btn active" data-section="mid">叶中</button>
+                                    <button class="section-btn" data-section="tip">叶尖</button>
+                                </div>
+                            </div>
+                            <div class="control-group">
+                                <label class="control-label">热力图范围</label>
+                                <div class="range-display">
+                                    <span id="minStrain">0</span>
+                                    <input type="range" id="heatmapRange" min="0" max="2000" value="1000">
+                                    <span id="maxStrain">2000 με</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="legend-panel">
+                            <div class="legend-title">图例</div>
+                            <div class="heatmap-legend">
+                                <div class="heatmap-gradient" id="heatmapGradient"></div>
+                                <div class="heatmap-labels">
+                                    <span>低</span>
+                                    <span>高 (应变)</span>
+                                </div>
+                            </div>
+                            <div class="ae-legend">
+                                <div class="ae-dot"></div>
+                                <span>声发射事件点</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="section-detail-panel" id="sectionDetailPanel">
+                        <div class="detail-header">
+                            <h3 id="detailTitle">叶中截面详细数据</h3>
+                            <button class="close-btn" id="closeDetail">×</button>
+                        </div>
+                        <div class="detail-content">
+                            <div class="detail-section">
+                                <h4>应变历史 (最近24小时)</h4>
+                                <canvas id="strainHistoryChart" width="500" height="200"></canvas>
+                            </div>
+                            <div class="detail-section">
+                                <h4>声发射特征</h4>
+                                <div class="ae-stats-grid">
+                                    <div class="ae-stat">
+                                        <span class="ae-label">事件总数</span>
+                                        <span class="ae-value" id="aeTotalCount">--</span>
+                                    </div>
+                                    <div class="ae-stat">
+                                        <span class="ae-label">平均幅值</span>
+                                        <span class="ae-value" id="aeAvgAmp">-- dB</span>
+                                    </div>
+                                    <div class="ae-stat">
+                                        <span class="ae-label">平均持续时间</span>
+                                        <span class="ae-value" id="aeAvgDur">-- μs</span>
+                                    </div>
+                                    <div class="ae-stat">
+                                        <span class="ae-label">平均频率</span>
+                                        <span class="ae-value" id="aeAvgFreq">-- kHz</span>
+                                    </div>
+                                </div>
+                                <canvas id="aeChart" width="500" height="150"></canvas>
+                            </div>
+                            <div class="detail-section">
+                                <h4>损伤概率评估</h4>
+                                <div class="damage-assessment">
+                                    <div class="damage-item">
+                                        <span class="damage-name">基体开裂</span>
+                                        <div class="damage-bar-container">
+                                            <div class="damage-bar matrix" id="detailMatrixBar"></div>
+                                        </div>
+                                        <span class="damage-percent" id="detailMatrixProb">--%</span>
+                                    </div>
+                                    <div class="damage-item">
+                                        <span class="damage-name">纤维断裂</span>
+                                        <div class="damage-bar-container">
+                                            <div class="damage-bar fiber" id="detailFiberBar"></div>
+                                        </div>
+                                        <span class="damage-percent" id="detailFiberProb">--%</span>
+                                    </div>
+                                    <div class="damage-item">
+                                        <span class="damage-name">分层损伤</span>
+                                        <div class="damage-bar-container">
+                                            <div class="damage-bar delamination" id="detailDelamBar"></div>
+                                        </div>
+                                        <span class="damage-percent" id="detailDelamProb">--%</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="view-container" id="healthView" style="display: none;">
+                <div class="chart-card full-width">
+                    <div class="chart-header">
+                        <h3>全场风机健康度排行榜</h3>
+                        <div class="chart-actions">
+                            <button class="action-btn" id="sortAsc">升序</button>
+                            <button class="action-btn active" id="sortDesc">降序</button>
+                        </div>
+                    </div>
+                    <div class="ranking-container" id="rankingContainer"></div>
+                </div>
+            </div>
+
+            <div class="view-container" id="damageView" style="display: none;">
+                <div class="charts-row">
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h3>损伤类型统计</h3>
+                        </div>
+                        <canvas id="damageTypeChart" width="400" height="350"></canvas>
+                    </div>
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h3>严重程度分布</h3>
+                        </div>
+                        <canvas id="severityChart" width="400" height="350"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card full-width">
+                    <div class="chart-header">
+                        <h3>损伤叶片详情</h3>
+                    </div>
+                    <div class="damage-table-container">
+                        <table class="damage-table">
+                            <thead>
+                                <tr>
+                                    <th>风机编号</th>
+                                    <th>叶片</th>
+                                    <th>健康度</th>
+                                    <th>损伤类型</th>
+                                    <th>严重程度</th>
+                                    <th>最近检查</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="damageTableBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="view-container" id="alarmsView" style="display: none;">
+                <div class="chart-card full-width">
+                    <div class="chart-header">
+                        <h3>告警中心</h3>
+                        <div class="alarm-filters">
+                            <button class="filter-btn active" data-filter="all">全部</button>
+                            <button class="filter-btn" data-filter="unack">未确认</button>
+                            <button class="filter-btn" data-filter="level1">一级告警</button>
+                            <button class="filter-btn" data-filter="level2">二级告警</button>
+                        </div>
+                    </div>
+                    <div class="alarms-container" id="alarmsContainer"></div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/bladeModel.js"></script>
+    <script src="js/charts.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>

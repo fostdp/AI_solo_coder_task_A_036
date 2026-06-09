@@ -1,0 +1,36 @@
+CREATE DATABASE wind_turbine_blades WITH DURATION 365d REPLICATION 1 SHARD DURATION 7d NAME "autogen"
+
+CREATE RETENTION POLICY "raw_data" ON "wind_turbine_blades" DURATION 90d REPLICATION 1 SHARD DURATION 1d
+CREATE RETENTION POLICY "hourly_agg" ON "wind_turbine_blades" DURATION 365d REPLICATION 1 SHARD DURATION 7d
+CREATE RETENTION POLICY "daily_agg" ON "wind_turbine_blades" DURATION 1095d REPLICATION 1 SHARD DURATION 30d
+
+CREATE CONTINUOUS QUERY "cq_strain_hourly" ON "wind_turbine_blades"
+BEGIN
+  SELECT mean(strain_value) AS mean_strain, max(strain_value) AS max_strain, min(strain_value) AS min_strain
+  INTO "hourly_agg"."strain_hourly"
+  FROM "raw_data"."strain_data"
+  GROUP BY time(1h), turbine_id, blade_id, sensor_id
+END
+
+CREATE CONTINUOUS QUERY "cq_strain_daily" ON "wind_turbine_blades"
+BEGIN
+  SELECT mean(strain_value) AS mean_strain, max(strain_value) AS max_strain, min(strain_value) AS min_strain
+  INTO "daily_agg"."strain_daily"
+  FROM "raw_data"."strain_data"
+  GROUP BY time(1d), turbine_id, blade_id, sensor_id
+END
+
+CREATE CONTINUOUS QUERY "cq_ae_hourly" ON "wind_turbine_blades"
+BEGIN
+  SELECT count(amplitude) AS event_count, mean(amplitude) AS mean_amplitude, max(amplitude) AS max_amplitude
+  INTO "hourly_agg"."ae_hourly"
+  FROM "raw_data"."ae_events"
+  GROUP BY time(1h), turbine_id, blade_id, sensor_id
+END
+
+CREATE USER "sensor_writer" WITH PASSWORD 'sensor_pass123'
+CREATE USER "dashboard_reader" WITH PASSWORD 'dash_pass123'
+CREATE USER "admin" WITH PASSWORD 'admin_pass123' WITH ALL PRIVILEGES
+
+GRANT WRITE ON wind_turbine_blades TO sensor_writer
+GRANT READ ON wind_turbine_blades TO dashboard_reader
