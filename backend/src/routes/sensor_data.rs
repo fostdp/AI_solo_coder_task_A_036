@@ -70,49 +70,94 @@ pub async fn receive_ae_events(
 ) -> impl IntoResponse {
     log::info!("收到声发射事件，共{}条", batch.events.len());
 
-    match state.influxdb.write_ae_events(&batch.events).await {
-        Ok(_) => {
-            for event in &batch.events {
-                let diagnosis = state.diagnosis.diagnose(
+    let mut damage_features_batch = Vec::with_capacity(batch.events.len());
+
+    for event in &batch.events {
+        let wind_speed = event.wind_speed.unwrap_or(8.0);
+        let rotor_speed = event.rotor_speed.unwrap_or(12.0);
+
+        let diagnosis = match state.diagnosis.diagnose_with_conditions(
+            event.amplitude,
+            event.duration,
+            event.frequency_peak,
+            event.frequency_center,
+            event.energy,
+            event.counts,
+            wind_speed,
+            rotor_speed,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("信号处理失败，使用原始诊断: {}", e);
+                state.diagnosis.diagnose(
                     event.amplitude,
                     event.duration,
                     event.frequency_peak,
                     event.frequency_center,
                     event.energy,
                     event.counts,
-                );
+                )
+            }
+        };
 
-                let damage_features = DamageFeatures {
-                    turbine_id: event.turbine_id.clone(),
-                    blade_id: event.blade_id.clone(),
-                    section: event.section.clone(),
-                    matrix_cracking_prob: diagnosis.matrix_cracking_prob,
-                    fiber_breakage_prob: diagnosis.fiber_breakage_prob,
-                    delamination_prob: diagnosis.delamination_prob,
-                    damage_severity: diagnosis.severity_level as i32 * 25,
-                    natural_frequency: 12.5,
-                    delamination_rate: diagnosis.delamination_prob * 10.0,
-                    health_score: 100 - (diagnosis.severity_level as i32 * 25),
-                    timestamp: event.timestamp,
-                };
+        let damage_features = DamageFeatures {
+            turbine_id: event.turbine_id.clone(),
+            blade_id: event.blade_id.clone(),
+            section: event.section.clone(),
+            matrix_cracking_prob: diagnosis.matrix_cracking_prob,
+            fiber_breakage_prob: diagnosis.fiber_breakage_prob,
+            delamination_prob: diagnosis.delamination_prob,
+            damage_severity: diagnosis.severity_level as i32 * 25,
+            natural_frequency: 12.5,
+            delamination_rate: diagnosis.delamination_prob * 10.0,
+            health_score: 100 - (diagnosis.severity_level as i32 * 25),
+            wind_speed,
+            rotor_speed,
+            timestamp: event.timestamp,
+        };
 
-                if let Err(e) = state.influxdb.write_damage_features(&damage_features).await {
+        damage_features_batch.push(damage_features);
+    }
+
+    let mut ae_events_to_write = Vec::with_capacity(batch.events.len());
+    for event in &batch.events {
+        ae_events_to_write.push(event.clone());
+    }
+
+    let first_features = damage_features_batch.first().cloned();
+
+    match state.influxdb.bulk_write_all(
+        &ae_events_to_write,
+        &[],
+        first_features.as_ref(),
+    ).await {
+        Ok(_) => {
+            for features in &damage_features_batch {
+                if let Err(e) = state.influxdb.write_damage_features(features).await {
                     log::error!("保存损伤特征失败: {}", e);
                 }
 
                 let mut alarm_engine = state.alarm_engine.lock().await;
-                if let Err(e) = alarm_engine.check_and_trigger_alarm(&damage_features).await {
+                
+                if let Err(e) = alarm_engine.check_frequency_with_conditions(
+                    features,
+                    None,
+                ) {
+                    log::error!("频率告警检查失败: {}", e);
+                }
+
+                if let Err(e) = alarm_engine.check_and_trigger_alarm(features).await {
                     log::error!("告警检查失败: {}", e);
                 }
             }
 
             (
                 StatusCode::OK,
-                Json(ApiResponse::success("声发射事件已保存并分析完成".to_string())),
+                Json(ApiResponse::success("声发射事件已保存并分析完成（已应用小波去噪和工况归一化）".to_string())),
             )
         }
         Err(e) => {
-            log::error!("保存声发射事件失败: {}", e);
+            log::error!("批量写入失败: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::<String>::error(&format!("保存失败: {}", e))),

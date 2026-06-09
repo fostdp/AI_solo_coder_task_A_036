@@ -22,6 +22,10 @@ pub struct StrainData {
     pub position_y: f64,
     #[schema(example = 10.5)]
     pub position_z: f64,
+    #[schema(example = 8.5)]
+    pub wind_speed: Option<f64>,
+    #[schema(example = 12.0)]
+    pub rotor_speed: Option<f64>,
     #[serde(default = "Utc::now")]
     pub timestamp: DateTime<Utc>,
 }

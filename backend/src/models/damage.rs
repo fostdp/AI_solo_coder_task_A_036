@@ -24,6 +24,10 @@ pub struct DamageFeatures {
     pub delamination_rate: f64,
     #[schema(example = 85)]
     pub health_score: i32,
+    #[schema(example = 8.5)]
+    pub wind_speed: f64,
+    #[schema(example = 12.0)]
+    pub rotor_speed: f64,
     #[serde(default = "Utc::now")]
     pub timestamp: DateTime<Utc>,
 }

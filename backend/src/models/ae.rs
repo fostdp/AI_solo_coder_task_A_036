@@ -26,6 +26,10 @@ pub struct AEEvent {
     pub counts: i32,
     #[schema(example = 250.0)]
     pub rise_time: f64,
+    #[schema(example = 8.5)]
+    pub wind_speed: Option<f64>,
+    #[schema(example = 12.0)]
+    pub rotor_speed: Option<f64>,
     #[serde(default = "Utc::now")]
     pub timestamp: DateTime<Utc>,
 }

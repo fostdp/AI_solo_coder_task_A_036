@@ -5,6 +5,10 @@ use rand_distr::{Normal, Distribution};
 use thiserror::Error;
 
 use crate::models::damage::{DiagnosisResult, DamageType};
+use crate::services::signal_processing::{
+    SignalProcessor, KrigingInterpolator, OrderTracker, ThresholdMethod,
+    SignalProcessingError, StrainReading,
+};
 
 #[derive(Error, Debug)]
 pub enum DiagnosisError {
@@ -17,6 +21,9 @@ pub enum DiagnosisError {
 pub struct DamageDiagnosisService {
     model: Arc<RandomForestModel>,
     baseline_frequency: f64,
+    signal_processor: SignalProcessor,
+    kriging_interpolator: KrigingInterpolator,
+    order_tracker: OrderTracker,
 }
 
 struct RandomForestModel {
@@ -45,7 +52,63 @@ impl DamageDiagnosisService {
         Ok(Self {
             model: Arc::new(model),
             baseline_frequency: 12.5,
+            signal_processor: SignalProcessor::new(),
+            kriging_interpolator: KrigingInterpolator::new(),
+            order_tracker: OrderTracker::new(1000.0, 10.0, 0.1),
         })
+    }
+
+    pub fn diagnose_with_conditions(
+        &self,
+        amplitude: f64,
+        duration: f64,
+        frequency_peak: f64,
+        frequency_center: f64,
+        energy: f64,
+        counts: i32,
+        wind_speed: f64,
+        rotor_speed: f64,
+    ) -> Result<DiagnosisResult, SignalProcessingError> {
+        let (denoised_amp, norm_dur, norm_freq, norm_energy) = self.signal_processor.denoise_ae_signal(
+            amplitude,
+            duration,
+            frequency_peak,
+            energy,
+            wind_speed,
+            rotor_speed,
+        )?;
+
+        let is_valid = self.signal_processor.adaptive_wind_speed_filter(
+            denoised_amp,
+            wind_speed,
+            counts,
+        );
+
+        if !is_valid {
+            return Ok(DiagnosisResult {
+                damage_type: DamageType::None,
+                severity_level: 0,
+                confidence: 0.95,
+                matrix_cracking_prob: 0.01,
+                fiber_breakage_prob: 0.005,
+                delamination_prob: 0.005,
+            });
+        }
+
+        let corrected_center = self.signal_processor.normalize_by_wind_speed(
+            frequency_center,
+            wind_speed,
+            crate::services::signal_processing::SignalType::Frequency,
+        )?;
+
+        Ok(self.diagnose(
+            denoised_amp,
+            norm_dur,
+            norm_freq,
+            corrected_center,
+            norm_energy,
+            counts,
+        ))
     }
 
     fn build_pretrained_model() -> Result<RandomForestModel, String> {
@@ -338,5 +401,81 @@ impl DamageDiagnosisService {
         }
 
         (features, labels)
+    }
+
+    pub fn interpolate_strain_field(
+        &self,
+        sensor_readings: &[StrainReading],
+        grid_resolution: usize,
+        blade_length: f64,
+        blade_chord: f64,
+    ) -> Result<crate::services::signal_processing::StrainField, SignalProcessingError> {
+        let mut interpolator = self.kriging_interpolator.clone();
+        
+        let known_points: Vec<(f64, f64, f64)> = sensor_readings
+            .iter()
+            .map(|r| (r.position_z, r.position_y, r.strain_value))
+            .collect();
+        
+        let _ = interpolator.fit_variogram(&known_points);
+        
+        interpolator.interpolate_strain_field(
+            sensor_readings,
+            grid_resolution,
+            blade_length,
+            blade_chord,
+        )
+    }
+
+    pub fn get_strain_at_position(
+        &self,
+        strain_field: &crate::services::signal_processing::StrainField,
+        position_z: f64,
+        position_y: f64,
+    ) -> Option<f64> {
+        strain_field.get_value_at(position_z, position_y)
+    }
+
+    pub fn get_strain_gradient(
+        &self,
+        strain_field: &crate::services::signal_processing::StrainField,
+        position_z: f64,
+        position_y: f64,
+    ) -> Option<(f64, f64)> {
+        strain_field.get_gradient(position_z, position_y)
+    }
+
+    pub fn analyze_natural_frequency(
+        &self,
+        vibration_signal: &[f64],
+        rotor_speed: f64,
+        wind_speed: f64,
+        frequency_threshold: f64,
+    ) -> Result<(bool, f64, f64), SignalProcessingError> {
+        let order_spectrum = self.order_tracker.compute_order_spectrum(
+            vibration_signal,
+            rotor_speed,
+            None,
+        )?;
+
+        let (natural_freq, raw_offset) = self.order_tracker.extract_natural_frequency(
+            &order_spectrum,
+            rotor_speed,
+        )?;
+
+        Ok(self.order_tracker.is_frequency_offset_valid(
+            natural_freq,
+            rotor_speed,
+            wind_speed,
+            frequency_threshold,
+        ))
+    }
+
+    pub fn get_order_tracker(&self) -> &OrderTracker {
+        &self.order_tracker
+    }
+
+    pub fn get_signal_processor(&self) -> &SignalProcessor {
+        &self.signal_processor
     }
 }

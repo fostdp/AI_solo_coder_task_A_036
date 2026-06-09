@@ -6,6 +6,8 @@ use thiserror::Error;
 use crate::models::damage::DamageFeatures;
 use crate::models::alarm::{Alarm, AlarmLevel, AlarmType};
 use crate::services::mes_pusher::MesPusher;
+use crate::services::signal_processing::OrderTracker;
+use ndarray::Array1;
 
 #[derive(Error, Debug)]
 pub enum AlarmError {
@@ -20,6 +22,11 @@ pub struct AlarmEngine {
     frequency_offset_threshold: f64,
     mes_pusher: Arc<MesPusher>,
     cooldown_periods: std::collections::HashMap<String, chrono::DateTime<Utc>>,
+    order_tracker: OrderTracker,
+    baseline_rotor_speed: f64,
+    valid_speed_range: (f64, f64),
+    valid_wind_range: (f64, f64),
+    frequency_history: std::collections::HashMap<String, Vec<(chrono::DateTime<Utc>, f64)>>,
 }
 
 impl AlarmEngine {
@@ -39,7 +46,164 @@ impl AlarmEngine {
             frequency_offset_threshold: freq_threshold,
             mes_pusher,
             cooldown_periods: std::collections::HashMap::new(),
+            order_tracker: OrderTracker::new(1000.0, 10.0, 0.1),
+            baseline_rotor_speed: 12.0,
+            valid_speed_range: (9.0, 15.0),
+            valid_wind_range: (3.0, 25.0),
+            frequency_history: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn check_frequency_with_conditions(
+        &mut self,
+        features: &DamageFeatures,
+        vibration_signal: Option<&[f64]>,
+    ) -> Result<(), AlarmError> {
+        let rotor_speed = features.rotor_speed;
+        let wind_speed = features.wind_speed;
+
+        let speed_stable = rotor_speed >= self.valid_speed_range.0 
+            && rotor_speed <= self.valid_speed_range.1
+            && (rotor_speed - self.baseline_rotor_speed).abs() < 3.0;
+
+        let wind_stable = wind_speed >= self.valid_wind_range.0 
+            && wind_speed <= self.valid_wind_range.1;
+
+        if !speed_stable || !wind_stable {
+            log::debug!(
+                "工况不稳定，跳过频率检查: 转速 {:.1} rpm, 风速 {:.1} m/s",
+                rotor_speed, wind_speed
+            );
+            return Ok(());
+        }
+
+        let natural_frequency = if let Some(signal) = vibration_signal {
+            match self.extract_natural_frequency(signal, rotor_speed) {
+                Ok(freq) => freq,
+                Err(e) => {
+                    log::warn!("阶次跟踪提取频率失败: {}", e);
+                    features.natural_frequency
+                }
+            }
+        } else {
+            self.normalize_frequency_by_speed(features.natural_frequency, rotor_speed)
+        };
+
+        let baseline_frequency = 12.5;
+        let offset = ((natural_frequency - baseline_frequency) / baseline_frequency).abs() * 100.0;
+
+        let key = format!(
+            "freq_{}_{}_{}",
+            features.turbine_id, features.blade_id, features.section
+        );
+
+        self.add_frequency_history(&key, natural_frequency);
+        let confirmed = self.confirm_frequency_trend(&key, offset);
+
+        if confirmed && offset >= self.frequency_offset_threshold {
+            if !self.is_in_cooldown(&key) {
+                let alarm = self.create_alarm(
+                    features,
+                    AlarmLevel::Level2,
+                    AlarmType::FrequencyOffset,
+                    offset,
+                    self.frequency_offset_threshold,
+                );
+
+                log::warn!(
+                    "二级告警触发: {}-{} {} 固有频率偏移 {:.1}% > 阈值 {:.1}% (转速 {:.1} rpm, 风速 {:.1} m/s)",
+                    features.turbine_id,
+                    features.blade_id,
+                    features.section,
+                    offset,
+                    self.frequency_offset_threshold,
+                    rotor_speed,
+                    wind_speed
+                );
+
+                let rt = tokio::runtime::Handle::try_current()
+                    .ok()
+                    .unwrap_or_else(|| {
+                        tokio::runtime::Runtime::new().unwrap().handle().clone()
+                    });
+                rt.spawn(async move {
+                    let _ = self.push_to_mes(&alarm).await;
+                });
+                self.set_cooldown(key);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn extract_natural_frequency(
+        &self,
+        vibration_signal: &[f64],
+        rotor_speed: f64,
+    ) -> Result<f64, String> {
+        let order_spectrum = self.order_tracker.compute_order_spectrum(
+            vibration_signal,
+            rotor_speed,
+            None,
+        ).map_err(|e| e.to_string())?;
+
+        let (freq, _) = self.order_tracker.extract_natural_frequency(
+            &order_spectrum,
+            rotor_speed,
+        ).map_err(|e| e.to_string())?;
+
+        Ok(freq)
+    }
+
+    fn normalize_frequency_by_speed(&self, measured_freq: f64, rotor_speed: f64) -> f64 {
+        let speed_ratio = self.baseline_rotor_speed / rotor_speed.max(0.1);
+        measured_freq * speed_ratio.sqrt()
+    }
+
+    fn add_frequency_history(&mut self, key: &str, frequency: f64) {
+        let history = self.frequency_history
+            .entry(key.to_string())
+            .or_insert_with(Vec::new);
+        
+        history.push((Utc::now(), frequency));
+        
+        if history.len() > 10 {
+            history.remove(0);
+        }
+    }
+
+    fn confirm_frequency_trend(&self, key: &str, current_offset: f64) -> bool {
+        if let Some(history) = self.frequency_history.get(key) {
+            if history.len() < 3 {
+                return false;
+            }
+
+            let recent_offsets: Vec<f64> = history.iter()
+                .rev()
+                .take(5)
+                .map(|(_, freq)| ((freq - 12.5) / 12.5).abs() * 100.0)
+                .collect();
+
+            let sustained_count = recent_offsets.iter()
+                .filter(|&&offset| offset >= self.frequency_offset_threshold * 0.8)
+                .count();
+
+            let avg_offset: f64 = recent_offsets.iter().sum::<f64>() / recent_offsets.len() as f64;
+
+            sustained_count >= 3 && avg_offset >= self.frequency_offset_threshold * 0.9
+        } else {
+            false
+        }
+    }
+
+    pub fn is_operating_condition_stable(&self, rotor_speed: f64, wind_speed: f64) -> bool {
+        let speed_ok = rotor_speed >= self.valid_speed_range.0 
+            && rotor_speed <= self.valid_speed_range.1;
+        let wind_ok = wind_speed >= self.valid_wind_range.0 
+            && wind_speed <= self.valid_wind_range.1;
+        let speed_stable = (rotor_speed - self.baseline_rotor_speed).abs() < 2.0;
+        
+        speed_ok && wind_ok && speed_stable
     }
 
     pub async fn check_and_trigger_alarm(

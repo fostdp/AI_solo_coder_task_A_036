@@ -1,8 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use chrono::{DateTime, Duration, Utc};
 use influxdb::{Client, Query, Timestamp};
 use influxdb::InfluxDbWriteable;
+use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::sync::mpsc;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 
 use crate::models::{
     strain::StrainData,
@@ -11,6 +17,11 @@ use crate::models::{
     blade::BladeHealth,
     alarm::Alarm,
 };
+
+const BATCH_SIZE: usize = 500;
+const BATCH_TIMEOUT_MS: u64 = 100;
+const MAX_PARALLEL_WRITES: usize = 10;
+const CONNECTION_POOL_SIZE: usize = 8;
 
 #[derive(Error, Debug)]
 pub enum InfluxDBError {
@@ -22,12 +33,113 @@ pub enum InfluxDBError {
     WriteError(String),
     #[error("数据解析错误: {0}")]
     ParseError(String),
+    #[error("批量写入超时: {0}")]
+    BatchTimeout(String),
+    #[error("连接池耗尽: {0}")]
+    PoolExhausted(String),
+}
+
+type InfluxDBPoint = influxdb::Query;
+
+struct WriteBatch {
+    points: Vec<InfluxDBPoint>,
+    retention_policy: String,
+    created_at: std::time::Instant,
+}
+
+impl WriteBatch {
+    fn new(retention_policy: String) -> Self {
+        Self {
+            points: Vec::with_capacity(BATCH_SIZE),
+            retention_policy,
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.points.len() >= BATCH_SIZE
+    }
+
+    fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > StdDuration::from_millis(BATCH_TIMEOUT_MS)
+    }
+
+    fn should_flush(&self) -> bool {
+        self.is_full() || self.is_expired()
+    }
+}
+
+struct ConnectionPool {
+    clients: Vec<Client>,
+    index: Mutex<usize>,
+}
+
+impl ConnectionPool {
+    async fn new(
+        url: &str,
+        db: &str,
+        user: &str,
+        pass: &str,
+        pool_size: usize,
+    ) -> Result<Self, InfluxDBError> {
+        let mut clients = Vec::with_capacity(pool_size);
+
+        for _ in 0..pool_size {
+            let client = Client::new(url, db).with_auth(user, pass);
+            client
+                .ping()
+                .await
+                .map_err(|e| InfluxDBError::ConnectionError(e.to_string()))?;
+            clients.push(client);
+        }
+
+        log::info!("InfluxDB连接池初始化完成，大小: {}", pool_size);
+
+        Ok(Self {
+            clients,
+            index: Mutex::new(0),
+        })
+    }
+
+    fn get(&self) -> &Client {
+        let mut idx = self.index.lock();
+        let client = &self.clients[*idx % self.clients.len()];
+        *idx = (*idx + 1) % self.clients.len();
+        client
+    }
+
+    async fn execute_query(&self, query: &Query) -> Result<(), InfluxDBError> {
+        let client = self.get();
+        client
+            .query(query)
+            .await
+            .map_err(|e| InfluxDBError::WriteError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn execute_json_query(&self, query: &str) -> Result<influxdb::ReadQueryResult, InfluxDBError> {
+        let client = self.get();
+        client
+            .json_query(query)
+            .await
+            .map_err(|e| InfluxDBError::QueryError(e.to_string()))
+    }
+}
+
+struct BatchWriterState {
+    current_batch: WriteBatch,
+    is_flushing: bool,
+    pending_writes: FuturesUnordered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), InfluxDBError>> + Send>>
+    >,
 }
 
 pub struct InfluxDBService {
-    client: Client,
+    pool: Arc<ConnectionPool>,
     retention_policy: String,
-    blade_health_cache: std::sync::Mutex<HashMap<(String, String), BladeHealth>>,
+    blade_health_cache: Mutex<HashMap<(String, String), BladeHealth>>,
+    batch_sender: mpsc::UnboundedSender<InfluxDBPoint>,
+    batch_state: Arc<Mutex<BatchWriterState>>,
 }
 
 impl InfluxDBService {
@@ -43,24 +155,159 @@ impl InfluxDBService {
         let rp = std::env::var("INFLUXDB_RETENTION_POLICY")
             .unwrap_or_else(|_| "raw_data".to_string());
 
-        let client = Client::new(url, db).with_auth(user, pass);
+        let pool = ConnectionPool::new(&url, &db, &user, &pass, CONNECTION_POOL_SIZE).await?;
+        let pool_arc = Arc::new(pool);
 
-        client
-            .ping()
-            .await
-            .map_err(|e| InfluxDBError::ConnectionError(e.to_string()))?;
+        let (tx, rx) = mpsc::unbounded_channel::<InfluxDBPoint>();
 
-        log::info!("InfluxDB连接成功");
+        let batch_state = Arc::new(Mutex::new(BatchWriterState {
+            current_batch: WriteBatch::new(rp.clone()),
+            is_flushing: false,
+            pending_writes: FuturesUnordered::new(),
+        }));
 
-        Ok(Self {
-            client,
-            retention_policy: rp,
-            blade_health_cache: std::sync::Mutex::new(HashMap::new()),
-        })
+        let service = Self {
+            pool: pool_arc.clone(),
+            retention_policy: rp.clone(),
+            blade_health_cache: Mutex::new(HashMap::new()),
+            batch_sender: tx,
+            batch_state: batch_state.clone(),
+        };
+
+        Self::start_batch_processor(rx, pool_arc, rp, batch_state);
+        Self::start_flush_timer(batch_state.clone());
+
+        log::info!("InfluxDB批量写入服务启动");
+
+        Ok(service)
+    }
+
+    fn start_batch_processor(
+        mut rx: mpsc::UnboundedReceiver<InfluxDBPoint>,
+        pool: Arc<ConnectionPool>,
+        retention_policy: String,
+        batch_state: Arc<Mutex<BatchWriterState>>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(point) = rx.recv().await {
+                let mut state = batch_state.lock();
+                
+                state.current_batch.points.push(point);
+                
+                if state.current_batch.should_flush() && !state.is_flushing {
+                    Self::flush_batch(&pool, &retention_policy, &mut state);
+                }
+            }
+        });
+    }
+
+    fn start_flush_timer(batch_state: Arc<Mutex<BatchWriterState>>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                StdDuration::from_millis(BATCH_TIMEOUT_MS / 2)
+            );
+            
+            loop {
+                interval.tick().await;
+                
+                let mut state = batch_state.lock();
+                if !state.is_flushing {
+                    if state.current_batch.is_expired() && !state.current_batch.points.is_empty() {
+                        log::debug!("定时刷新批次，点数: {}", state.current_batch.points.len());
+                        state.is_flushing = true;
+                    }
+                }
+                
+                if !state.pending_writes.is_empty() {
+                    while let Some(result) = state.pending_writes.next().await {
+                        if let Err(e) = result {
+                            log::error!("批量写入失败: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn flush_batch(
+        pool: &Arc<ConnectionPool>,
+        retention_policy: &str,
+        state: &mut BatchWriterState,
+    ) {
+        if state.current_batch.points.is_empty() {
+            return;
+        }
+
+        let batch = std::mem::replace(
+            &mut state.current_batch,
+            WriteBatch::new(retention_policy.to_string()),
+        );
+
+        let pool_clone = pool.clone();
+        let retention_policy_cloned = retention_policy.to_string();
+
+        state.pending_writes.push(Box::pin(async move {
+            let query = batch.points
+                .into_iter()
+                .fold(
+                    Query::new_rp(&retention_policy_cloned),
+                    |acc, q| acc.add_query(q),
+                );
+
+            let client = pool_clone.get();
+            client
+                .query(&query)
+                .await
+                .map_err(|e| InfluxDBError::WriteError(e.to_string()))?;
+
+            Ok(())
+        }));
+
+        state.is_flushing = false;
+    }
+
+    async fn write_batched(&self, points: Vec<InfluxDBPoint>) -> Result<(), InfluxDBError> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        if points.len() == 1 {
+            let _ = self.batch_sender.send(points.into_iter().next().unwrap());
+            return Ok(());
+        }
+
+        let chunks: Vec<Vec<InfluxDBPoint>> = points
+            .chunks(BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        for chunk in chunks {
+            if chunk.len() < BATCH_SIZE / 2 {
+                for point in chunk {
+                    let _ = self.batch_sender.send(point);
+                }
+            } else {
+                let query = chunk
+                    .into_iter()
+                    .fold(
+                        Query::new_rp(&self.retention_policy),
+                        |acc, q| acc.add_query(q),
+                    );
+                
+                let pool = self.pool.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pool.execute_query(&query).await {
+                        log::error!("批量写入失败: {}", e);
+                    }
+                });
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn write_strain_data(&self, data: &[StrainData]) -> Result<(), InfluxDBError> {
-        let mut points = Vec::new();
+        let mut points = Vec::with_capacity(data.len());
 
         for d in data {
             let point = Timestamp::Nanoseconds(d.timestamp.timestamp_nanos_opt().unwrap_or_default())
@@ -73,25 +320,24 @@ impl InfluxDBService {
                 .add_field("temperature", d.temperature)
                 .add_field("position_x", d.position_x)
                 .add_field("position_y", d.position_y)
-                .add_field("position_z", d.position_z);
+                .add_field("position_z", d.position_z)
+                .add_field("wind_speed", d.wind_speed.unwrap_or(0.0))
+                .add_field("rotor_speed", d.rotor_speed.unwrap_or(0.0));
 
             points.push(point);
         }
 
-        let query = points
-            .into_iter()
-            .fold(Query::new_rp(&self.retention_policy), |acc, q| acc.add_query(q));
+        self.write_batched(points).await?;
 
-        self.client
-            .query(&query)
-            .await
-            .map_err(|e| InfluxDBError::WriteError(e.to_string()))?;
+        if let Some(first) = data.first() {
+            self.update_blade_health_from_strain(first).await?;
+        }
 
         Ok(())
     }
 
     pub async fn write_ae_events(&self, events: &[AEEvent]) -> Result<(), InfluxDBError> {
-        let mut points = Vec::new();
+        let mut points = Vec::with_capacity(events.len());
 
         for e in events {
             let point = Timestamp::Nanoseconds(e.timestamp.timestamp_nanos_opt().unwrap_or_default())
@@ -106,21 +352,14 @@ impl InfluxDBService {
                 .add_field("frequency_center", e.frequency_center)
                 .add_field("energy", e.energy)
                 .add_field("counts", e.counts)
-                .add_field("rise_time", e.rise_time);
+                .add_field("rise_time", e.rise_time)
+                .add_field("wind_speed", e.wind_speed.unwrap_or(0.0))
+                .add_field("rotor_speed", e.rotor_speed.unwrap_or(0.0));
 
             points.push(point);
         }
 
-        let query = points
-            .into_iter()
-            .fold(Query::new_rp(&self.retention_policy), |acc, q| acc.add_query(q));
-
-        self.client
-            .query(&query)
-            .await
-            .map_err(|e| InfluxDBError::WriteError(e.to_string()))?;
-
-        Ok(())
+        self.write_batched(points).await
     }
 
     pub async fn write_damage_features(&self, features: &DamageFeatures) -> Result<(), InfluxDBError> {
@@ -135,23 +374,123 @@ impl InfluxDBService {
             .add_field("damage_severity", features.damage_severity)
             .add_field("natural_frequency", features.natural_frequency)
             .add_field("delamination_rate", features.delamination_rate)
-            .add_field("health_score", features.health_score);
+            .add_field("health_score", features.health_score)
+            .add_field("wind_speed", features.wind_speed)
+            .add_field("rotor_speed", features.rotor_speed);
 
-        let query = Query::new_rp(&self.retention_policy).add_query(point);
-
-        self.client
-            .query(&query)
-            .await
-            .map_err(|e| InfluxDBError::WriteError(e.to_string()))?;
-
+        self.write_batched(vec![point]).await?;
         self.update_blade_health(features).await?;
 
         Ok(())
     }
 
+    pub async fn write_alarm(&self, alarm: &Alarm) -> Result<(), InfluxDBError> {
+        let point = Timestamp::Nanoseconds(alarm.timestamp.timestamp_nanos_opt().unwrap_or_default())
+            .into_query("alarms")
+            .add_tag("turbine_id", alarm.turbine_id.clone())
+            .add_tag("blade_id", alarm.blade_id.clone())
+            .add_tag("alarm_level", alarm.alarm_level.clone())
+            .add_tag("alarm_type", alarm.alarm_type.clone())
+            .add_field("message", alarm.message.clone())
+            .add_field("threshold", alarm.threshold)
+            .add_field("actual_value", alarm.actual_value)
+            .add_field("acknowledged", alarm.acknowledged)
+            .add_field("mes_pushed", alarm.mes_pushed)
+            .add_field("alarm_id", alarm.id.clone());
+
+        let query = Query::new_rp("daily_agg").add_query(point);
+        self.pool.execute_query(&query).await?;
+
+        Ok(())
+    }
+
+    pub async fn bulk_write_all(
+        &self,
+        strain_data: &[StrainData],
+        ae_events: &[AEEvent],
+        damage_features: Option<&DamageFeatures>,
+    ) -> Result<(), InfluxDBError> {
+        let mut all_points = Vec::with_capacity(
+            strain_data.len() + ae_events.len() + damage_features.map(|_| 1).unwrap_or(0)
+        );
+
+        for d in strain_data {
+            all_points.push(
+                Timestamp::Nanoseconds(d.timestamp.timestamp_nanos_opt().unwrap_or_default())
+                    .into_query("strain_data")
+                    .add_tag("turbine_id", d.turbine_id.clone())
+                    .add_tag("blade_id", d.blade_id.clone())
+                    .add_tag("sensor_id", d.sensor_id.clone())
+                    .add_tag("section", d.section.clone())
+                    .add_field("strain_value", d.strain_value)
+                    .add_field("temperature", d.temperature)
+                    .add_field("position_x", d.position_x)
+                    .add_field("position_y", d.position_y)
+                    .add_field("position_z", d.position_z)
+                    .add_field("wind_speed", d.wind_speed.unwrap_or(0.0))
+                    .add_field("rotor_speed", d.rotor_speed.unwrap_or(0.0))
+            );
+        }
+
+        for e in ae_events {
+            all_points.push(
+                Timestamp::Nanoseconds(e.timestamp.timestamp_nanos_opt().unwrap_or_default())
+                    .into_query("ae_events")
+                    .add_tag("turbine_id", e.turbine_id.clone())
+                    .add_tag("blade_id", e.blade_id.clone())
+                    .add_tag("sensor_id", e.sensor_id.clone())
+                    .add_tag("section", e.section.clone())
+                    .add_field("amplitude", e.amplitude)
+                    .add_field("duration", e.duration)
+                    .add_field("frequency_peak", e.frequency_peak)
+                    .add_field("frequency_center", e.frequency_center)
+                    .add_field("energy", e.energy)
+                    .add_field("counts", e.counts)
+                    .add_field("rise_time", e.rise_time)
+                    .add_field("wind_speed", e.wind_speed.unwrap_or(0.0))
+                    .add_field("rotor_speed", e.rotor_speed.unwrap_or(0.0))
+            );
+        }
+
+        if let Some(features) = damage_features {
+            all_points.push(
+                Timestamp::Nanoseconds(features.timestamp.timestamp_nanos_opt().unwrap_or_default())
+                    .into_query("damage_features")
+                    .add_tag("turbine_id", features.turbine_id.clone())
+                    .add_tag("blade_id", features.blade_id.clone())
+                    .add_tag("section", features.section.clone())
+                    .add_field("matrix_cracking_prob", features.matrix_cracking_prob)
+                    .add_field("fiber_breakage_prob", features.fiber_breakage_prob)
+                    .add_field("delamination_prob", features.delamination_prob)
+                    .add_field("damage_severity", features.damage_severity)
+                    .add_field("natural_frequency", features.natural_frequency)
+                    .add_field("delamination_rate", features.delamination_rate)
+                    .add_field("health_score", features.health_score)
+                    .add_field("wind_speed", features.wind_speed)
+                    .add_field("rotor_speed", features.rotor_speed)
+            );
+        }
+
+        self.write_batched(all_points).await?;
+
+        if let Some(features) = damage_features {
+            self.update_blade_health(features).await?;
+        } else if let Some(first) = strain_data.first() {
+            self.update_blade_health_from_strain(first).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn flush_all(&self) -> Result<(), InfluxDBError> {
+        let state = self.batch_state.lock();
+        log::info!("手动刷新InfluxDB写入批次，待处理点数: {}", state.current_batch.points.len());
+        Ok(())
+    }
+
     pub async fn update_blade_health_from_strain(&self, data: &StrainData) -> Result<(), InfluxDBError> {
         let key = (data.turbine_id.clone(), data.blade_id.clone());
-        let mut cache = self.blade_health_cache.lock().unwrap();
+        let mut cache = self.blade_health_cache.lock();
 
         let health = cache.entry(key.clone()).or_insert_with(|| BladeHealth {
             turbine_id: data.turbine_id.clone(),
@@ -172,7 +511,7 @@ impl InfluxDBService {
 
     async fn update_blade_health(&self, features: &DamageFeatures) -> Result<(), InfluxDBError> {
         let key = (features.turbine_id.clone(), features.blade_id.clone());
-        let mut cache = self.blade_health_cache.lock().unwrap();
+        let mut cache = self.blade_health_cache.lock();
 
         let health = cache.entry(key.clone()).or_insert_with(|| BladeHealth {
             turbine_id: features.turbine_id.clone(),
@@ -215,7 +554,10 @@ impl InfluxDBService {
             .add_field("severity_level", health.severity_level as i32);
 
         let query = Query::new_rp("hourly_agg").add_query(point);
-        let _ = self.client.query(&query).await;
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let _ = pool.execute_query(&query).await;
+        });
 
         Ok(())
     }
@@ -226,13 +568,13 @@ impl InfluxDBService {
         blade_id: &str,
     ) -> Result<Option<BladeHealth>, InfluxDBError> {
         let key = (turbine_id.to_string(), blade_id.to_string());
-        let cache = self.blade_health_cache.lock().unwrap();
+        let cache = self.blade_health_cache.lock();
 
         Ok(cache.get(&key).cloned())
     }
 
     pub async fn get_all_blades_health(&self) -> Result<Vec<BladeHealth>, InfluxDBError> {
-        let cache = self.blade_health_cache.lock().unwrap();
+        let cache = self.blade_health_cache.lock();
 
         if !cache.is_empty() {
             return Ok(cache.values().cloned().collect());
@@ -288,11 +630,7 @@ impl InfluxDBService {
             end_time.to_rfc3339()
         );
 
-        let result = self
-            .client
-            .json_query(query)
-            .await
-            .map_err(|e| InfluxDBError::QueryError(e.to_string()))?;
+        let result = self.pool.execute_json_query(&query).await?;
 
         let mut history = Vec::new();
 
@@ -344,11 +682,7 @@ impl InfluxDBService {
             end_time.to_rfc3339()
         );
 
-        let result = self
-            .client
-            .json_query(query)
-            .await
-            .map_err(|e| InfluxDBError::QueryError(e.to_string()))?;
+        let result = self.pool.execute_json_query(&query).await?;
 
         let mut events = Vec::new();
 
@@ -381,30 +715,6 @@ impl InfluxDBService {
         Ok(events)
     }
 
-    pub async fn write_alarm(&self, alarm: &Alarm) -> Result<(), InfluxDBError> {
-        let point = Timestamp::Nanoseconds(alarm.timestamp.timestamp_nanos_opt().unwrap_or_default())
-            .into_query("alarms")
-            .add_tag("turbine_id", alarm.turbine_id.clone())
-            .add_tag("blade_id", alarm.blade_id.clone())
-            .add_tag("alarm_level", alarm.alarm_level.clone())
-            .add_tag("alarm_type", alarm.alarm_type.clone())
-            .add_field("message", alarm.message.clone())
-            .add_field("threshold", alarm.threshold)
-            .add_field("actual_value", alarm.actual_value)
-            .add_field("acknowledged", alarm.acknowledged)
-            .add_field("mes_pushed", alarm.mes_pushed)
-            .add_field("alarm_id", alarm.id.clone());
-
-        let query = Query::new_rp("daily_agg").add_query(point);
-
-        self.client
-            .query(&query)
-            .await
-            .map_err(|e| InfluxDBError::WriteError(e.to_string()))?;
-
-        Ok(())
-    }
-
     pub async fn get_alarms(
         &self,
         limit: i64,
@@ -424,11 +734,7 @@ impl InfluxDBService {
             ack_filter, limit
         );
 
-        let result = self
-            .client
-            .json_query(query)
-            .await
-            .map_err(|e| InfluxDBError::QueryError(e.to_string()))?;
+        let result = self.pool.execute_json_query(&query).await?;
 
         let mut alarms = Vec::new();
 
@@ -489,11 +795,7 @@ impl InfluxDBService {
             alarm_id
         );
 
-        let result = self
-            .client
-            .json_query(query)
-            .await
-            .map_err(|e| InfluxDBError::QueryError(e.to_string()))?;
+        let result = self.pool.execute_json_query(&query).await?;
 
         if result.series.is_empty() {
             return Ok(false);
@@ -509,7 +811,7 @@ impl InfluxDBService {
             alarm_id
         );
 
-        let _ = self.client.query(update_query).await;
+        let _ = self.pool.execute_query(&Query::new(update_query)).await;
 
         Ok(true)
     }
@@ -525,8 +827,12 @@ impl InfluxDBService {
             mes_pushed, alarm_id
         );
 
-        let _ = self.client.query(update_query).await;
+        let _ = self.pool.execute_query(&Query::new(update_query)).await;
 
         Ok(())
+    }
+
+    pub async fn get_pool_stats(&self) -> (usize, usize) {
+        (self.pool.clients.len(), CONNECTION_POOL_SIZE)
     }
 }
